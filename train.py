@@ -1,0 +1,407 @@
+import os
+import time
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import DataLoader
+
+import wandb
+
+from model import TransformerModel
+from data import (
+    count_modulation_symbols,
+    build_joint_constellation,
+    MIMOSequenceDataset,
+)
+from config import parameter_reading
+
+
+
+def build_model(embedding_dim, n_positions, num_heads, num_layers, num_classes):
+    """Build the TransformerModel used for ICL equalization."""
+    model = TransformerModel(
+        n_positions=2 * n_positions,   # because x/y are interleaved
+        n_embd=embedding_dim,
+        n_layer=num_layers,
+        n_head=num_heads,
+        n_classes=num_classes,
+    )
+    return model
+
+
+
+def icl_train(model, ys_batch, xs_batch, optimizer, loss_func, args):
+    """One-step ICL training.
+
+    ys_batch: (B, T, dim_y) = real-valued received features [Re(y), Im(y)]
+    xs_batch: (B, T, C)     = one-hot ground truth transmit symbols (joint constellation)
+    """
+    model.train()
+
+    # Forward pass through the model
+    logits = model(ys_batch, xs_batch)               # (B, T, C)
+
+    # Targets: class indices from one-hot x
+    xs_indices = torch.argmax(xs_batch, dim=-1)      # (B, T)
+
+    # Cross-entropy over classes at each time step
+    # loss_func is CrossEntropyLoss(reduction="none") -> (B, T)
+    loss_per_token = loss_func(logits.transpose(1, 2), xs_indices)
+    loss_mean = loss_per_token.mean()
+
+    optimizer.zero_grad()
+    loss_mean.backward()
+    optimizer.step()
+
+    return loss_mean.detach().item(), logits.detach()
+
+
+def DEFINED_train(args, model, ys_batch, xs_batch,
+                  optimizer, loss_func, train_pilot_len):
+    """Decision Feedback training (DFE), equivalent to original sequence_train_step.
+
+    ys_batch: (B, T, dim_y) = received features
+    xs_batch: (B, T, C)     = one-hot ground truth transmit symbols
+    """
+    torch.autograd.set_detect_anomaly(True)
+    model.train()
+
+    bsize, length, dim = xs_batch.shape
+    xin = torch.zeros_like(xs_batch)   # feedback sequence
+    pilot_len = train_pilot_len
+
+    # Build the decision-feedback sequence xin under no_grad
+    with torch.no_grad():
+        for i in range(length):
+            if i < pilot_len:
+                # For pilot positions, we feed the true x
+                xin = torch.cat([xin[:, :i, :], xs_batch[:, i:, :]], dim=1)
+            else:
+                # Run the model with current feedback sequence xin
+                # Note: original code uses full ys_batch here (not truncated yin)
+                x_hat = model(ys_batch, xin)                    # (B, T, C)
+                probabilities = torch.softmax(x_hat, dim=-1)
+                _, max_indices = torch.max(probabilities, dim=-1)  # (B, T)
+
+                one_hot_encoded = torch.nn.functional.one_hot(
+                    max_indices, num_classes=args.modu_num
+                ).float()                                       # (B, T, C)
+
+                # Replace from position i onward with predicted symbols
+                xin = torch.cat([xin[:, :i, :], one_hot_encoded[:, i:, :]], dim=1)
+
+    # 1) Loss when using decision-feedback sequence xin
+    x_prob1 = model(ys_batch, xin)                  # (B, T, C)
+    xs_real_indices = torch.argmax(xs_batch, dim=-1)   # (B, T)
+    loss1 = loss_func(x_prob1.transpose(1, 2), xs_real_indices)  # (B, T)
+
+    # 2) Loss when using full teacher forcing xs_batch (pure ICL)
+    x_prob2 = model(ys_batch, xs_batch)             # (B, T, C)
+    loss2 = loss_func(x_prob2.transpose(1, 2), xs_real_indices)  # (B, T)
+
+    # Weighted combination (same as original)
+    weight = args.loss_weight
+    total_loss = (weight * loss1 + (1.0 - weight) * loss2).mean()
+
+    optimizer.zero_grad()
+    total_loss.backward()
+    optimizer.step()
+
+    return total_loss.detach().item(), x_prob1.detach()
+
+
+
+def icl_val(model, ys_batch, xs_batch, args):
+    """Evaluate symbol error rate using pure ICL (no decision feedback)."""
+    model.eval()
+    with torch.no_grad():
+        logits = model(ys_batch, xs_batch)         # (B, T, C)
+        pred_indices = torch.argmax(logits, dim=-1)    # (B, T)
+        true_indices = torch.argmax(xs_batch, dim=-1)  # (B, T)
+
+        errors = (pred_indices != true_indices)        # (B, T)
+        length_errors = errors.float().mean(dim=0)     # (T,)
+        mean_errors = length_errors.mean().item()
+        length_errors_list = length_errors.cpu().numpy().tolist()
+
+    return length_errors_list, mean_errors
+
+
+
+def DEFINED_val(model, ys_batch, xs_batch, args, train_pilot_len):
+    """Evaluate sequence error rate with decision feedback (DFE)."""
+    model.eval()
+    with torch.no_grad():
+        bsize, length, dim = xs_batch.shape
+        xin = torch.zeros_like(xs_batch)
+        yin = torch.zeros_like(ys_batch)
+        pilot_len = train_pilot_len
+
+        for i in range(length):
+            # Accumulate ys into yin, so the model only "sees" up to time i
+            yin[:, i, :] = ys_batch[:, i, :]
+            if i < pilot_len:
+                xin[:, i, :] = xs_batch[:, i, :]
+            else:
+                x_hat = model(yin, xin)                    # (B, T, C)
+                probabilities = torch.softmax(x_hat, dim=-1)
+                _, max_indices = torch.max(probabilities, dim=-1)
+                one_hot_encoded = torch.nn.functional.one_hot(
+                    max_indices, num_classes=args.modu_num
+                ).float()
+                xin[:, i, :] = one_hot_encoded[:, i, :]
+
+        # Compare predicted xin with ground truth xs_batch
+        errors = (xs_batch != xin).any(dim=2)       # (B, T)
+        length_errors = errors.float().mean(dim=0)  # (T,)
+        mean_errors = length_errors.mean().item()
+        remaining_mean_errors = length_errors[train_pilot_len:].mean().item()
+        length_errors_list = length_errors.cpu().numpy().tolist()
+
+    return length_errors_list, remaining_mean_errors
+
+
+
+def trainNetwork(model_GPT2, args, task_name, device):
+    """Full training loop using MIMOSequenceDataset and ICL/DEFINED training."""
+    # ---------------- WandB init ----------------
+    wandb.init(
+        project="DEFINED",
+        name=task_name,
+    )
+
+    loss_function_model_GPT2 = nn.CrossEntropyLoss(reduction="none")
+    optimizer_model_GPT2 = optim.AdamW(model_GPT2.parameters(), lr=args.learning_rate)
+
+    # ---------------- Build joint constellation & datasets ----------------
+    # For SISO (num_ant=1), joint_constellation size == args.modu_num
+    joint_constellation = build_joint_constellation(args.modulation, args.num_ant)
+    num_classes = joint_constellation.shape[0]
+    args.modu_num = num_classes  # ensure consistency with joint constellation size
+
+    n_train = int(1e3)
+    # Train dataset: large "infinite" style dataset
+    train_dataset = MIMOSequenceDataset(
+        args=args,
+        num_samples=n_train,
+        joint_constellation=joint_constellation,
+        channel_type="rayleigh",
+        K_factor=1.0,
+        seed=0,
+    )
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=args.batch_size,
+        shuffle=True,
+        drop_last=True,
+        num_workers=0,
+    )
+
+    # Validation dataset: fixed samples for stable evaluation
+    n_val = int(2e3)
+    val_dataset = MIMOSequenceDataset(
+        args=args,
+        num_samples=n_val,
+        joint_constellation=joint_constellation,
+        channel_type="rayleigh",
+        K_factor=1.0,
+        seed=123,
+    )
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=n_val,
+        shuffle=False,
+        drop_last=True,
+        num_workers=0,
+    )
+    # Take one big validation batch
+    val_batch = next(iter(val_loader))
+    y_val = val_batch["y"].to(device)  # (B_val, T, 2N)
+    x_val = val_batch["x"].to(device)  # (B_val, T, C)
+
+    # ---------------- Training config ----------------
+    n_it_per_epoch = 10
+    log_every = 10
+    SAVE_MODEL = True
+
+    best_val = 1e9
+    best_it = 0
+
+    for epoch in range(args.epochs):
+        running_loss = 0.0
+
+        # One epoch: take n_it_per_epoch mini-batches
+        for it, batch in enumerate(train_loader):
+            if it >= n_it_per_epoch:
+                break
+
+            ys_batch = batch["y"].to(device)  # (B, T, 2N)
+            xs_batch = batch["x"].to(device)  # (B, T, C)
+
+            # 1) ICL phase, 2) DEFINED phase
+            if args.DFE_TRAIN:
+                if epoch == 0 and it == 0:
+                    print("*** Start DFE Train:", task_name)
+
+                if epoch < args.DFE_epoch:
+                    # ICL training phase
+                    loss, output = icl_train(
+                        model_GPT2,
+                        ys_batch=ys_batch,
+                        xs_batch=xs_batch,
+                        optimizer=optimizer_model_GPT2,
+                        loss_func=loss_function_model_GPT2,
+                        args=args,
+                    )
+                else:
+                    # Decision-feedback training phase
+                    loss, output = DEFINED_train(
+                        args,
+                        model_GPT2,
+                        ys_batch=ys_batch,
+                        xs_batch=xs_batch,
+                        optimizer=optimizer_model_GPT2,
+                        loss_func=loss_function_model_GPT2,
+                        train_pilot_len=args.train_pilot_len
+                    )
+            else:
+                if epoch == 0 and it == 0:
+                    print("*** Start ICL Train:", task_name)
+
+                loss, output = icl_train(
+                    model_GPT2,
+                    ys_batch=ys_batch,
+                    xs_batch=xs_batch,
+                    optimizer=optimizer_model_GPT2,
+                    loss_func=loss_function_model_GPT2,
+                    args=args,
+                )
+
+            running_loss += loss / n_it_per_epoch
+
+        # Log training loss
+        wandb.log({"Train: Cross-Entropy Loss": running_loss, "epoch": epoch})
+
+        # ---------------- Validation ----------------
+        if epoch % log_every == 0:
+            if args.DFE_TRAIN:
+                length_errors_list, mean_errors = DEFINED_val(
+                    model_GPT2,
+                    ys_batch=y_val,
+                    xs_batch=x_val,
+                    args=args,
+                    train_pilot_len=args.train_pilot_len,
+                )
+            else:
+                length_errors_list, mean_errors = icl_val(
+                    model_GPT2,
+                    ys_batch=y_val,
+                    xs_batch=x_val,
+                    args=args,
+                )
+
+            wandb.log(
+                {
+                    "Test: Symbol Error Rate": mean_errors,
+                    "epoch": epoch,
+                }
+            )
+
+            if mean_errors < best_val:
+                best_val = mean_errors
+                best_it = epoch
+
+        # ---------------- Save model periodically ----------------
+        if SAVE_MODEL and epoch % 200 == 0:
+            time_id = time.strftime("%m%d%H%M%S", time.localtime())
+            save_dir = "./models"
+            os.makedirs(save_dir, exist_ok=True)
+            save_path = os.path.join(
+                save_dir, f"{task_name}_Epoch{epoch}_{time_id}.pth"
+            )
+
+            # Recommended: save state_dict + args + epoch
+            checkpoint = {
+                "epoch": epoch,
+                "model_state_dict": model_GPT2.state_dict(),
+                "args": vars(args),        # store all hyperparameters
+            }
+
+            torch.save(checkpoint, save_path)
+            print(f"*** Saved model checkpoint (state_dict) at epoch {epoch} to {save_path}")
+
+    print(f"*** Best validation SER: {best_val:.4e} at epoch {best_it}")
+    wandb.finish()
+    return
+
+
+# -------------------------------------------------------------------------- #
+# Main
+# -------------------------------------------------------------------------- #
+if __name__ == "__main__":
+    os.environ["CUDA_VISIBLE_DEVICES"] = "0"
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print("Using device:", device)
+
+    args = parameter_reading()
+
+    # Model / training hyperparameters
+    args.num_head = 8
+    args.num_layer = 8
+    args.embedding_dim = 64
+    args.embedding_dim_single = 64
+
+    args.prompt_seq_length = 31
+    args.batch_size = 512
+    args.epochs = 8000
+
+    args.num_ant = 2
+
+    args.modulation = "QPSK"
+    args.train_pilot_len = 2
+    args.SNR_dB_min = 10
+    args.SNR_dB_max = 20
+    args.modu_num = count_modulation_symbols(args)  # initial value, later overwritten by joint constellation size
+    args.loss_weight = 0.7
+    args.DFE_epoch = 2500
+    args.DFE_TRAIN = True  # enable DFE two-phase training
+
+    task_name = (
+        "DEFINED_ant"
+        + str(args.num_ant)
+        + "_"
+        + args.modulation
+        + "_SNR["
+        + str(args.SNR_dB_min)
+        + ","
+        + str(args.SNR_dB_max)
+        + "]"
+        + "_Seq"
+        + str(args.prompt_seq_length)
+        + "_Layer"
+        + str(args.num_layer)
+        + "Emb"
+        + str(args.embedding_dim)
+        + "Head"
+        + str(args.num_head)
+    )
+
+    model = build_model(
+        embedding_dim=args.embedding_dim,
+        n_positions=args.prompt_seq_length,
+        num_heads=args.num_head,
+        num_layers=args.num_layer,
+        num_classes=args.modu_num,
+    ).to(device)
+
+    print(args)
+
+    total_trainable_params = sum(
+        p.numel() for p in model.parameters() if p.requires_grad
+    )
+    print(f"***Total number of parameters in the model: {total_trainable_params}")
+
+    trainNetwork(model.to(device), args, task_name=task_name, device=device)
+
+    print("***Training is done:", task_name)
